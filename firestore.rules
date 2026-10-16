@@ -1,0 +1,299 @@
+
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // -----------------------------------------
+    // Authentication and role helpers
+    // -----------------------------------------
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function userPath(uid) {
+      return /databases/$(database)/documents/users/$(uid);
+    }
+
+    function hasUserProfile() {
+      return signedIn()
+        && exists(userPath(request.auth.uid));
+    }
+
+    function myProfile() {
+      return get(userPath(request.auth.uid)).data;
+    }
+
+    function isAdmin() {
+      return hasUserProfile()
+        && myProfile().role == 'admin';
+    }
+
+    function isManager() {
+      return hasUserProfile()
+        && myProfile().role == 'manager';
+    }
+
+    function isEmployee() {
+      return hasUserProfile()
+        && myProfile().role == 'employee';
+    }
+
+    function myDepartment() {
+      return myProfile().department;
+    }
+
+    function validRole(role) {
+      return role in ['admin', 'manager', 'employee'];
+    }
+
+    function validProfile(data) {
+      return data.keys().hasAll([
+          'name', 'email', 'role', 'department', 'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'name', 'email', 'role', 'department',
+          'createdAt', 'updatedAt'
+        ])
+        && data.name is string
+        && data.name.size() > 0
+        && data.email is string
+        && data.department is string
+        && validRole(data.role)
+        && data.createdAt is timestamp;
+    }
+
+    function validTaskStatus(status) {
+      return status in ['pending', 'in-progress', 'completed'];
+    }
+
+    function validTaskPriority(priority) {
+      return priority in ['low', 'medium', 'high'];
+    }
+
+    function employeeExists(uid) {
+      return exists(userPath(uid));
+    }
+
+    function employeeDepartment(uid) {
+      return get(userPath(uid)).data.department;
+    }
+
+    // -----------------------------------------
+    // Employee profiles
+    // -----------------------------------------
+
+    match /users/{userId} {
+
+      // Users read their own profile.
+      // Admins read all profiles.
+      // Managers read profiles in their department.
+      allow get: if signedIn()
+        && (
+          request.auth.uid == userId
+          || isAdmin()
+          || (
+            isManager()
+            && resource.data.department == myDepartment()
+          )
+        );
+
+      // Manager queries must constrain results to their department.
+      allow list: if isAdmin()
+        || (
+          isManager()
+          && resource.data.department == myDepartment()
+        );
+
+      // Create a profile.
+      // Self-registration is restricted to employee role.
+      // allow create: if validProfile(request.resource.data)
+      //   && request.resource.data.createdAt == request.time
+      //   && (
+      //     (
+      //       signedIn()
+      //       && request.auth.uid == userId
+      //       && request.resource.data.role == 'employee'
+      //       && request.resource.data.email == request.auth.token.email
+      //     )
+      //     ||
+      //     (
+      //       isAdmin()
+      //       && request.resource.data.role in ['employee', 'manager']
+      //     )
+      //     ||
+      //     (
+      //       isManager()
+      //       && request.resource.data.role == 'employee'
+      //       && request.resource.data.department == myDepartment()
+      //     )
+      //   );
+      // Create a profile.
+         allow create: if validProfile(request.resource.data)
+        // Ensure createdAt is simply a valid timestamp (avoids exact time skew errors)
+           && request.resource.data.createdAt is timestamp
+           && (
+          // Self-registration (employee only)
+             (
+               signedIn()
+               && request.auth.uid == userId
+               && request.resource.data.role == 'employee'
+               && request.resource.data.email == request.auth.token.email
+             )
+             ||
+            // Admin can create employees, managers
+             (
+               isAdmin()
+               && request.resource.data.role in ['employee', 'manager']
+             )
+            ||
+            // Manager can create employees in their own department
+            (
+              isManager()
+              && request.resource.data.role == 'employee'
+              && request.resource.data.department == myDepartment()
+            )
+        );
+
+      // Admin can update profiles but cannot change their own role.
+      // Managers can update employee profiles in their department.
+      // Employees can update only their own name and email.
+      allow update: if (
+          isAdmin()
+          && (
+            request.auth.uid != userId
+            || request.resource.data.role == resource.data.role
+          )
+          && validProfile(request.resource.data)
+          && request.resource.data.createdAt is timestamp
+        )
+        || (
+          isManager()
+          && resource.data.role == 'employee'
+          && resource.data.department == myDepartment()
+          && request.resource.data.role == 'employee'
+          && request.resource.data.department == resource.data.department
+          && request.resource.data.diff(resource.data)
+            .affectedKeys().hasOnly(['name', 'email'])
+          && request.resource.data.name is string
+          && request.resource.data.email is string
+        )
+        || (
+          signedIn()
+          && request.auth.uid == userId
+          && request.resource.data.diff(resource.data)
+            .affectedKeys().hasOnly(['name', 'email'])
+          && request.resource.data.name is string
+          && request.resource.data.email is string
+          && request.resource.data.role == resource.data.role
+          && request.resource.data.department == resource.data.department
+        );
+
+      // Only admins can delete profiles.
+      allow delete: if isAdmin();
+    }
+
+    // -----------------------------------------
+    // Tasks
+    // -----------------------------------------
+
+    function validTask(data) {
+      return data.keys().hasAll([
+          'title', 'description', 'assignedTo',
+          'assignedToName', 'status', 'priority',
+          'dueDate', 'createdBy', 'createdAt',
+          'updatedAt', 'department'
+        ])
+        && data.keys().hasOnly([
+          'title', 'description', 'assignedTo',
+          'assignedToName', 'status', 'priority',
+          'dueDate', 'createdBy', 'createdAt',
+          'updatedAt', 'department'
+        ])
+        && data.title is string
+        && data.title.size() > 0
+        && data.description is string
+        && data.assignedTo is string
+        && data.assignedToName is string
+        && data.createdBy is string
+        && data.department is string
+        && validTaskStatus(data.status)
+        && validTaskPriority(data.priority)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    match /tasks/{taskId} {
+
+      // Admins read all tasks.
+      // Managers read tasks in their department.
+      // Employees read only tasks assigned to them.
+      allow get, list: if isAdmin()
+        || (
+          isManager()
+          && resource.data.department == myDepartment()
+        )
+        || (
+          isEmployee()
+          && resource.data.assignedTo == request.auth.uid
+        );
+
+      // Admins and managers can create tasks.
+      allow create: if validTask(request.resource.data)
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time
+        && employeeExists(request.resource.data.assignedTo)
+        && employeeDepartment(request.resource.data.assignedTo)
+          == request.resource.data.department
+        && (
+          isAdmin()
+          || (
+            isManager()
+            && request.resource.data.department == myDepartment()
+          )
+        );
+
+      // Admins can update any valid task.
+      // Managers can update tasks in their department.
+      // Employees can update only their assigned task status.
+      allow update: if (
+          isAdmin()
+          && validTask(request.resource.data)
+          && request.resource.data.createdBy == resource.data.createdBy
+          && request.resource.data.createdAt == resource.data.createdAt
+          && employeeExists(request.resource.data.assignedTo)
+        )
+        || (
+          isManager()
+          && resource.data.department == myDepartment()
+          && validTask(request.resource.data)
+          && request.resource.data.department == resource.data.department
+          && request.resource.data.createdBy == resource.data.createdBy
+          && request.resource.data.createdAt == resource.data.createdAt
+          && employeeExists(request.resource.data.assignedTo)
+          && employeeDepartment(request.resource.data.assignedTo)
+            == myDepartment()
+        )
+        || (
+          isEmployee()
+          && resource.data.assignedTo == request.auth.uid
+          && request.resource.data.diff(resource.data)
+            .affectedKeys().hasOnly(['status', 'updatedAt'])
+          && validTaskStatus(request.resource.data.status)
+          && request.resource.data.updatedAt == request.time
+        );
+
+      // Employees cannot delete tasks.
+      allow delete: if isAdmin()
+        || (
+          isManager()
+          && resource.data.department == myDepartment()
+        );
+    }
+
+    // Everything else is denied by default.
+  }
+}
